@@ -148,13 +148,7 @@ Adaptive segment source=system seconds=10.00 rms=... reason=max_duration
 %APPDATA%\MiMoLiveCaption\app.log
 ```
 
-## 打包 EXE
 
-先运行一次 `run.bat`，然后双击 `build_exe.bat`。生成文件位于：
-
-```text
-dist\MiMoLiveCaption.exe
-```
 
 ## 接口文档
 
