@@ -1,0 +1,2 @@
+This sample project is provided as-is for personal and internal development use.
+Review the licenses of all third-party dependencies before redistribution.
