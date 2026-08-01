@@ -93,13 +93,6 @@ SiliconFlow 当前公开的 `/v1/audio/transcriptions` 接口返回一次性 JSO
 
 API Key 分别保存到 Windows 凭据管理器，互不覆盖。
 
-## 升级
-
-建议把 ZIP 解压到新目录并双击 `run.bat`。
-
-0.6.0 新增了 `webrtcvad-wheels` 依赖，因此不能只覆盖 `app.py` 后跳过依赖安装。新版 `run.bat` 会创建新的 `.deps_060_ok` 标记并自动安装依赖。该包提供 Windows 和 Python 3.12 的二进制 wheel，不需要本机编译 C++。
-
-旧版配置会自动迁移；没有智能分片字段时，默认启用 VAD。
 
 ## 音频设置
 
