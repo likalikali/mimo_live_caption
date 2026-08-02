@@ -1,32 +1,22 @@
 # Changelog
 
-## 0.6.0
+## 0.9.2
 
-- Replaced fixed-duration segmentation with adaptive voice activity segmentation by default.
-- Added WebRTC VAD with adaptive background-energy gating.
-- Added configurable VAD aggressiveness, end-of-speech pause, and maximum utterance duration.
-- Added pre-roll, post-roll, minimum-speech filtering, and max-duration overlap.
-- Added VAD state feedback: idle, speaking, and segment submitted.
-- Added MiMo SSE streaming response parsing and live in-place subtitle updates.
-- Kept SiliconFlow transcription non-streaming because its public transcription endpoint currently documents only a final `text` response.
-- Retained fixed-duration segmentation as a compatibility fallback.
-- Added `webrtcvad-wheels` dependency and PyInstaller collection rule.
+- 默认隐藏字幕时间戳和 `[我]/[会议]` 标签，以麦克风绿色、电脑声音蓝色区分两个音源。
+- 新增时间戳、音源标签和两种字幕颜色设置；修改后立即重新渲染已有字幕。
+- 新增并优先支持 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`。
+- 模型解析器可自动识别 Streaming Paraformer 或旧 Streaming Transducer 模型。
+- 旧 Transducer 本地模型改用 `modified_beam_search`，提高临时字幕稳定性。
+- 本地全大写英文临时结果自动转换为可读句式，并保留常见技术缩写。
+- 麦克风与电脑声音使用独立的句末停顿和最长语音段参数。
+- 默认电脑声音句末停顿提高到 1100 毫秒，最长段提高到 25 秒，减少句中误切。
+- 强制最长时长切片的音频上下文重叠提高到约 900 毫秒。
+- 云端相邻结果使用忽略标点、空格和大小写的边界去重。
+- 本地逐词字幕启用时，云端校正默认使用一次性响应，避免无正文的流式结束错误。
+- 下载脚本新增 `accurate` 与 `fast` 两种模型选项，默认通过项目代理下载 accurate 模型。
 
-## 0.5.0
+## 0.9.1
 
-- Added selectable ASR providers: MiMo and SiliconFlow.
-- Added SiliconFlow multipart audio transcription support.
-- Added `FunAudioLLM/SenseVoiceSmall` and `TeleAI/TeleSpeechASR` presets.
-- Added editable SiliconFlow model ID and API base URL.
-- Added separate Windows Credential Manager entries for MiMo and SiliconFlow keys.
-- Added provider/model information to logs and status labels.
-- Preserved all 0.4.0 WASAPI loopback and Windows ducking fixes.
-
-## 0.4.0
-
-- Fixed possible loss of playback audio while microphone and loopback capture are active.
-- Enforced input-only streams (`output=False`) for microphone and WASAPI loopback.
-- Added MME/DirectSound microphone compatibility remapping.
-- Added one-time Windows communication ducking opt-out prompt.
-- Replaced blocking reads with PortAudio callbacks.
-- Improved deterministic stream shutdown and logging.
+- 本地 sherpa-onnx 流式模型默认保存到当前项目/EXE 目录下的 `models` 文件夹。
+- 安装脚本默认通过 `http://127.0.0.1:20800` 下载。
+- 支持代理参数、环境变量和断点续传。

@@ -4,4 +4,7 @@ numpy>=2.0,<3
 requests>=2.32,<3
 keyring>=25,<27
 webrtcvad-wheels>=2.0.14,<3
+PySocks>=1.7.1,<2
+sherpa-onnx>=1.10,<2
+sherpa-onnx-bin>=1.10,<2
 pyinstaller>=6.10,<7
