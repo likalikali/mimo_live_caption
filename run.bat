@@ -1,40 +1,39 @@
 @echo off
-setlocal EnableExtensions
+setlocal
 cd /d "%~dp0"
-echo [1/3] Preparing Python environment...
+set UV_LINK_MODE=copy
 
-if not exist ".venv\Scripts\python.exe" (
-  py -3.12 -m venv .venv
-  if errorlevel 1 goto :fail
-)
-
-set "PY=.venv\Scripts\python.exe"
-
-if not exist ".deps_060_ok" (
-  echo [2/3] Checking and installing dependencies...
+if not exist .venv\Scripts\python.exe (
+  echo [1/3] Creating virtual environment...
   where uv >nul 2>nul
-  if not errorlevel 1 (
-    uv pip install --python "%PY%" --link-mode copy -r requirements.txt
+  if %errorlevel%==0 (
+    uv venv --python 3.12 .venv
   ) else (
-    "%PY%" -m pip --version >nul 2>nul
-    if errorlevel 1 "%PY%" -m ensurepip --upgrade
-    "%PY%" -m pip install --upgrade pip
-    "%PY%" -m pip install -r requirements.txt
+    py -3.12 -m venv .venv
   )
-  if errorlevel 1 goto :fail
-  type nul > .deps_060_ok
-) else (
-  echo [2/3] Dependencies ready.
 )
 
-echo [3/3] Starting Adaptive Multi-model Live Caption...
-"%PY%" app.py
-if errorlevel 1 goto :fail
+call .venv\Scripts\activate.bat
+
+echo [2/3] Checking and installing dependencies...
+where uv >nul 2>nul
+if %errorlevel%==0 (
+  uv pip install -r requirements.txt --link-mode=copy
+) else (
+  python -m ensurepip --upgrade
+  python -m pip install --upgrade pip
+  python -m pip install -r requirements.txt
+)
+if errorlevel 1 goto :failed
+
+echo [3/3] Starting Multi-model Live Caption...
+python app.py
+if errorlevel 1 goto :failed
 exit /b 0
 
-:fail
+:failed
 echo.
 echo Installation or startup failed.
-echo Log: %%APPDATA%%\MiMoLiveCaption\app.log
+echo Please copy the messages above when reporting the problem.
 pause
 exit /b 1

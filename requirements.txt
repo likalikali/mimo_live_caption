@@ -1,7 +1,10 @@
 PySide6>=6.8,<7
 PyAudioWPatch>=0.2.12.8
 numpy>=2.0,<3
-requests>=2.32,<3
+requests[socks]>=2.32,<3
 keyring>=25,<27
 webrtcvad-wheels>=2.0.14,<3
+sherpa-onnx>=1.12,<2
+websocket-client>=1.8,<2
+google-cloud-speech>=2.40,<3
 pyinstaller>=6.10,<7
