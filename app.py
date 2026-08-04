@@ -39,6 +39,12 @@ from google_speech_streaming import (
     GoogleSpeechStreamingWorker,
     google_speech_config_status,
 )
+from qwen_streaming import (
+    QWEN_AUDIO_STREAMING_MODEL,
+    QwenStreamingConfig,
+    QwenStreamingSignals,
+    QwenStreamingWorker,
+)
 
 try:
     import webrtcvad
@@ -79,12 +85,20 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "MiMo Live Caption"
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 KEYRING_SERVICE = "MiMoLiveCaption"
 MIMO_KEYRING_ACCOUNT = "mimo_api_key"
 SILICONFLOW_KEYRING_ACCOUNT = "siliconflow_api_key"
 DOUBAO_ACCESS_TOKEN_KEYRING_ACCOUNT = "doubao_streaming_access_token"
 DOUBAO_API_KEY_KEYRING_ACCOUNT = "doubao_streaming_api_key"
+QWEN_API_KEY_KEYRING_ACCOUNT = "qwen_audio_streaming_api_key"
+QWEN_LEGACY_KEYRING_ACCOUNTS = (
+    "qwen3_asr_realtime_api_key",
+    "qwen3_asr_api_key",
+    "qwen_realtime_api_key",
+    "qwen_api_key",
+    "dashscope_api_key",
+)
 # Legacy translation accounts are kept only for one-time migration.
 TRANSLATION_KEYRING_ACCOUNT = "translation_api_key"
 TRANSLATION_PRESET_KEYRING_PREFIX = "translation_preset_api_key:"
@@ -113,6 +127,7 @@ PROVIDER_NAMES = {
     "mimo": "MiMo",
     "siliconflow": "SiliconFlow",
     "doubao_streaming": "豆包流式 ASR 2.0",
+    "qwen_audio_streaming": "Qwen-Audio 3.0 ASR Flash Streaming",
 }
 SILICONFLOW_MODELS = (
     "FunAudioLLM/SenseVoiceSmall",
@@ -1046,6 +1061,17 @@ class AppConfig:
     # in bounded chunks instead of waiting for a long speech run to finish.
     doubao_multilingual_chunk_seconds: float = 5.0
     doubao_hotwords: str = ""
+    # Qwen-Audio 3.0 ASR Flash Streaming uses the DashScope duplex WebSocket
+    # protocol and returns intermediate result-generated events across languages.
+    qwen_model: str = QWEN_AUDIO_STREAMING_MODEL
+    qwen_workspace_id: str = ""
+    qwen_region: str = "cn-beijing"
+    # auto sends no language_hints; comma-separated values such as zh,en,ja are
+    # supported and the service uses at most the first four hints.
+    qwen_language_hints: str = "auto"
+    qwen_max_sentence_silence_ms: int = 800
+    qwen_packet_ms: int = 100
+    qwen_hotwords: str = ""
     # Japanese can use Google Cloud Speech-to-Text V2 Chirp 3 for genuine
     # bidirectional interim results. If local credentials are unavailable, the app
     # falls back to Doubao's bounded-chunk Japanese mode.
@@ -1095,6 +1121,57 @@ class AppConfig:
         try:
             data = json.loads(config_path().read_text(encoding="utf-8"))
             valid = {k: data[k] for k in cls.__annotations__ if k in data}
+            # Migrate the earlier Qwen3-ASR Realtime integration to the newer
+            # Qwen-Audio 3.0 streaming protocol.  The model name cannot simply be
+            # replaced in the old WebSocket session protocol, so upgrades switch
+            # the provider and preserve any compatible workspace/region settings.
+            legacy_qwen_providers = {
+                "qwen3_asr_realtime",
+                "qwen3_realtime",
+                "qwen_asr_realtime",
+                "qwen_realtime",
+                "dashscope_realtime",
+            }
+            configured_provider = str(data.get("api_provider") or "")
+            configured_qwen_model = str(
+                data.get("qwen_model")
+                or data.get("qwen3_model")
+                or data.get("asr_model")
+                or ""
+            )
+            if (
+                configured_provider in legacy_qwen_providers
+                or configured_qwen_model.startswith("qwen3-asr-flash-realtime")
+            ):
+                valid["api_provider"] = "qwen_audio_streaming"
+                valid["qwen_model"] = QWEN_AUDIO_STREAMING_MODEL
+            legacy_qwen_fields = {
+                "qwen_workspace_id": (
+                    "qwen3_workspace_id",
+                    "qwen_asr_workspace_id",
+                    "dashscope_workspace_id",
+                    "workspace_id",
+                ),
+                "qwen_region": ("qwen3_region", "qwen_asr_region", "dashscope_region"),
+                "qwen_language_hints": (
+                    "qwen3_language_hints",
+                    "qwen_asr_language_hints",
+                    "qwen_language",
+                ),
+                "qwen_max_sentence_silence_ms": (
+                    "qwen3_silence_duration_ms",
+                    "qwen_silence_duration_ms",
+                    "qwen_max_sentence_silence",
+                ),
+                "qwen_hotwords": ("qwen3_hotwords", "qwen_asr_hotwords"),
+            }
+            for target, aliases in legacy_qwen_fields.items():
+                if target in data:
+                    continue
+                for alias in aliases:
+                    if alias in data and data[alias] not in (None, ""):
+                        valid[target] = data[alias]
+                        break
             # Migrate the 0.8.x request-heavy preview to local online ASR.
             if "local_streaming_enabled" not in data:
                 valid["local_streaming_enabled"] = True
@@ -1198,6 +1275,21 @@ def load_api_key(provider: str) -> str:
             or os.getenv("VOLCENGINE_ASR_ACCESS_TOKEN", "").strip()
         )
         return env_key or _load_keyring_value(DOUBAO_ACCESS_TOKEN_KEYRING_ACCOUNT)
+    if provider == "qwen_audio_streaming":
+        env_key = (
+            os.getenv("DASHSCOPE_API_KEY", "").strip()
+            or os.getenv("QWEN_ASR_API_KEY", "").strip()
+        )
+        if env_key:
+            return env_key
+        current = _load_keyring_value(QWEN_API_KEY_KEYRING_ACCOUNT)
+        if current:
+            return current
+        for legacy_account in QWEN_LEGACY_KEYRING_ACCOUNTS:
+            legacy = _load_keyring_value(legacy_account)
+            if legacy:
+                return legacy
+        return ""
     if provider == "siliconflow":
         env_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
         return env_key or _load_keyring_value(SILICONFLOW_KEYRING_ACCOUNT)
@@ -1314,6 +1406,8 @@ def save_api_key(provider: str, api_key: str) -> None:
         return
     if provider == "doubao_streaming":
         account = DOUBAO_ACCESS_TOKEN_KEYRING_ACCOUNT
+    elif provider == "qwen_audio_streaming":
+        account = QWEN_API_KEY_KEYRING_ACCOUNT
     elif provider == "siliconflow":
         account = SILICONFLOW_KEYRING_ACCOUNT
     else:
@@ -1968,6 +2062,8 @@ class AudioEngine(QThread):
             else self.config.system_max_segment_seconds
         )
         is_doubao_streaming = self.config.api_provider == "doubao_streaming"
+        is_qwen_streaming = self.config.api_provider == "qwen_audio_streaming"
+        is_cloud_streaming = is_doubao_streaming or is_qwen_streaming
         doubao_language = str(self.config.doubao_language or "auto")
         google_japanese_active = bool(
             getattr(self.config, "_google_stt_japanese_active", False)
@@ -1989,7 +2085,7 @@ class AudioEngine(QThread):
             # Google StreamingRecognize streams may remain open for at most five
             # minutes. Rotate slightly early during uninterrupted audio.
             effective_max_seconds = min(285.0, max(30.0, max_seconds))
-        elif is_doubao_streaming:
+        elif is_cloud_streaming:
             effective_max_seconds = max(300.0, max_seconds)
         else:
             effective_max_seconds = max_seconds
@@ -2004,13 +2100,13 @@ class AudioEngine(QThread):
             max_segment_seconds=effective_max_seconds,
             checkpoint_enabled=(
                 self.config.cloud_progressive_correction
-                and not is_doubao_streaming
+                and not is_cloud_streaming
             ),
             checkpoint_min_seconds=self.config.cloud_checkpoint_min_seconds,
             checkpoint_pause_ms=self.config.cloud_checkpoint_pause_ms,
             checkpoint_max_seconds=self.config.cloud_checkpoint_max_seconds,
-            split_overlap_ms=0 if is_doubao_streaming else 900,
-            carry_previous_tail=not is_doubao_streaming,
+            split_overlap_ms=0 if is_cloud_streaming else 900,
+            carry_previous_tail=not is_cloud_streaming,
         )
 
     def _emit_pcm_segment(
@@ -2116,7 +2212,7 @@ class AudioEngine(QThread):
                                 # wait indefinitely for another packet.
                                 if (
                                     self.config.local_streaming_enabled
-                                    or self.config.api_provider == "doubao_streaming"
+                                    or self.config.api_provider in {"doubao_streaming", "qwen_audio_streaming"}
                                 ):
                                     sent = live_sent_bytes[source]
                                     if (
@@ -2147,7 +2243,7 @@ class AudioEngine(QThread):
 
                             if (
                                 self.config.local_streaming_enabled
-                                or self.config.api_provider == "doubao_streaming"
+                                or self.config.api_provider in {"doubao_streaming", "qwen_audio_streaming"}
                             ) and segmenter.active:
                                 live_pcm, started_at = segmenter.live_snapshot()
                                 if started_at != live_started_at[source]:
@@ -2197,6 +2293,14 @@ class AudioEngine(QThread):
             for source in streams:
                 if self.config.segmentation_mode == "vad":
                     for data, timestamp, reason in segmenters[source].flush():
+                        if (
+                            self.config.local_streaming_enabled
+                            or self.config.api_provider
+                            in {"doubao_streaming", "qwen_audio_streaming"}
+                        ):
+                            sent = live_sent_bytes[source]
+                            if len(data) > sent:
+                                self.live_pcm.emit(source, data[sent:], timestamp)
                         self._emit_pcm_segment(source, data, timestamp, reason)
                         self.live_end.emit(source, timestamp)
                 else:
@@ -3823,11 +3927,16 @@ class SettingsDialog(QDialog):
         self.provider.addItem("MiMo", "mimo")
         self.provider.addItem("SiliconFlow", "siliconflow")
         self.provider.addItem("豆包流式 ASR 2.0（按调用时长）", "doubao_streaming")
+        self.provider.addItem(
+            "Qwen-Audio 3.0 ASR Flash Streaming（多语种按量付费）",
+            "qwen_audio_streaming",
+        )
         self.provider.setCurrentIndex(max(0, self.provider.findData(config.api_provider)))
         self._model_values = {
             "mimo": config.mimo_model,
             "siliconflow": config.siliconflow_model,
             "doubao_streaming": "doubao-seed-asr-2.0",
+            "qwen_audio_streaming": config.qwen_model or QWEN_AUDIO_STREAMING_MODEL,
         }
         self._current_provider = config.api_provider
         self.provider.currentIndexChanged.connect(self.on_provider_changed)
@@ -3984,6 +4093,65 @@ class SettingsDialog(QDialog):
         self.doubao_hotwords.setPlainText(config.doubao_hotwords)
         self.doubao_hotwords.setPlaceholderText("每行或逗号分隔，例如：东京字节、Moonshot AI、Kimi K3")
         self.doubao_hotwords.setMaximumHeight(90)
+
+        self.qwen_api_key = QLineEdit(load_api_key("qwen_audio_streaming"))
+        self.qwen_api_key.setEchoMode(QLineEdit.Password)
+        self.qwen_api_key.setPlaceholderText("阿里云百炼 API Key；也可使用 DASHSCOPE_API_KEY")
+        self.qwen_api_key_row, self.qwen_api_key_toggle = self._build_secret_row(
+            self.qwen_api_key
+        )
+        self.qwen_region = QComboBox()
+        self.qwen_region.addItem("华北 2（北京，国内）", "cn-beijing")
+        self.qwen_region.addItem("新加坡（国际）", "ap-southeast-1")
+        self.qwen_region.setCurrentIndex(
+            max(0, self.qwen_region.findData(config.qwen_region or "cn-beijing"))
+        )
+        self.qwen_workspace_id = QLineEdit(config.qwen_workspace_id)
+        self.qwen_workspace_id.setPlaceholderText("例如 llm-xxxxxxxxxxxxxxxx")
+        self.qwen_language_hints = QComboBox()
+        self.qwen_language_hints.setEditable(True)
+        for label, value in (
+            ("自动检测（推荐，多语种）", "auto"),
+            ("中文 + 英文 + 日语", "zh,en,ja"),
+            ("中文 / 中英混合", "zh,en"),
+            ("日语", "ja"),
+            ("韩语", "ko"),
+        ):
+            self.qwen_language_hints.addItem(label, value)
+        qwen_lang_index = self.qwen_language_hints.findData(
+            config.qwen_language_hints or "auto"
+        )
+        if qwen_lang_index >= 0:
+            self.qwen_language_hints.setCurrentIndex(qwen_lang_index)
+        else:
+            self.qwen_language_hints.setEditText(config.qwen_language_hints or "auto")
+        self.qwen_language_hints.setToolTip(
+            "自动检测时不发送 language_hints。也可输入最多四个逗号分隔代码，例如 zh,en,ja,ko。"
+        )
+        self.qwen_sentence_silence = QComboBox()
+        for label, value in (
+            ("400 ms（定稿快，可能切碎）", 400),
+            ("600 ms（低延迟）", 600),
+            ("800 ms（推荐）", 800),
+            ("1300 ms（官方默认，句子更完整）", 1300),
+            ("1800 ms（连续讲话）", 1800),
+        ):
+            self.qwen_sentence_silence.addItem(label, value)
+        self.qwen_sentence_silence.setCurrentIndex(
+            max(0, self.qwen_sentence_silence.findData(int(config.qwen_max_sentence_silence_ms)))
+        )
+        self.qwen_hotwords = QTextEdit()
+        self.qwen_hotwords.setPlainText(config.qwen_hotwords)
+        self.qwen_hotwords.setPlaceholderText(
+            "每行或逗号分隔。会作为即时热词发送，例如：Kimi K3、Moonshot AI、清结算"
+        )
+        self.qwen_hotwords.setMaximumHeight(90)
+        self.qwen_streaming_help = QLabel(
+            "服务端会连续返回 result-generated 中间结果，界面收到一帧就原位更新；"
+            "sentence_end=true 后定稿。模型固定为 qwen-audio-3.0-asr-flash-streaming。"
+        )
+        self.qwen_streaming_help.setWordWrap(True)
+        self.qwen_streaming_help.setStyleSheet("color:#aaaaaa;font-size:12px;")
 
         self.language = QComboBox()
         self.language.addItem("自动检测", "auto")
@@ -4381,6 +4549,18 @@ class SettingsDialog(QDialog):
         self.doubao_provider_box = QGroupBox("豆包流式 ASR 2.0")
         self.doubao_provider_box.setLayout(doubao_form)
 
+        qwen_form = QFormLayout()
+        qwen_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        qwen_form.addRow("百炼 API Key", self.qwen_api_key_row)
+        qwen_form.addRow("地域", self.qwen_region)
+        qwen_form.addRow("Workspace ID", self.qwen_workspace_id)
+        qwen_form.addRow("识别语言", self.qwen_language_hints)
+        qwen_form.addRow("服务端判停", self.qwen_sentence_silence)
+        qwen_form.addRow("即时热词", self.qwen_hotwords)
+        qwen_form.addRow("流式行为", self.qwen_streaming_help)
+        self.qwen_provider_box = QGroupBox("Qwen-Audio 3.0 ASR Flash Streaming")
+        self.qwen_provider_box.setLayout(qwen_form)
+
         correction_form = QFormLayout()
         correction_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         correction_form.addRow("本地逐词字幕", self.low_latency_preview)
@@ -4462,6 +4642,7 @@ class SettingsDialog(QDialog):
         asr_tab_layout.addWidget(self.mimo_provider_box)
         asr_tab_layout.addWidget(self.silicon_provider_box)
         asr_tab_layout.addWidget(self.doubao_provider_box)
+        asr_tab_layout.addWidget(self.qwen_provider_box)
         asr_tab_layout.addWidget(self.cloud_correction_box)
         asr_tab_layout.addWidget(audio_box)
         asr_tab_layout.addWidget(display_box)
@@ -4762,24 +4943,32 @@ class SettingsDialog(QDialog):
         is_mimo = provider == "mimo"
         is_silicon = provider == "siliconflow"
         is_doubao = provider == "doubao_streaming"
+        is_qwen = provider == "qwen_audio_streaming"
+        is_cloud_streaming = is_doubao or is_qwen
+
         if is_silicon:
             self.model.addItems(list(SILICONFLOW_MODELS))
             target = self._model_values["siliconflow"]
         elif is_doubao:
             self.model.addItem("doubao-seed-asr-2.0")
             target = "doubao-seed-asr-2.0"
+        elif is_qwen:
+            self.model.addItem(QWEN_AUDIO_STREAMING_MODEL)
+            target = QWEN_AUDIO_STREAMING_MODEL
         else:
             self.model.addItem("mimo-v2.5-asr")
             target = self._model_values["mimo"]
 
-        self.model.setEnabled(not is_doubao)
-        if is_doubao:
+        self.model.setEnabled(not is_cloud_streaming)
+        if is_cloud_streaming:
             vad_index = self.segmentation.findData("vad")
             if vad_index >= 0:
                 self.segmentation.setCurrentIndex(vad_index)
-        self.segmentation.setEnabled(not is_doubao)
+        self.segmentation.setEnabled(not is_cloud_streaming)
         self.language.setEnabled(is_mimo)
-        self._set_secret_field_enabled(self.mimo_api_key, self.mimo_api_key_toggle, is_mimo)
+        self._set_secret_field_enabled(
+            self.mimo_api_key, self.mimo_api_key_toggle, is_mimo
+        )
         self._set_secret_field_enabled(
             self.siliconflow_api_key, self.siliconflow_api_key_toggle, is_silicon
         )
@@ -4788,6 +4977,9 @@ class SettingsDialog(QDialog):
         )
         self._set_secret_field_enabled(
             self.doubao_access_token, self.doubao_access_token_toggle, is_doubao
+        )
+        self._set_secret_field_enabled(
+            self.qwen_api_key, self.qwen_api_key_toggle, is_qwen
         )
         self.siliconflow_base_url.setEnabled(is_silicon)
         for widget in (
@@ -4800,23 +4992,46 @@ class SettingsDialog(QDialog):
             self.doubao_hotwords,
         ):
             widget.setEnabled(is_doubao)
+        for widget in (
+            self.qwen_region,
+            self.qwen_workspace_id,
+            self.qwen_language_hints,
+            self.qwen_sentence_silence,
+            self.qwen_hotwords,
+            self.qwen_streaming_help,
+        ):
+            widget.setEnabled(is_qwen)
         self.doubao_effective_mode.setEnabled(is_doubao)
         self.on_doubao_language_changed()
         self.stream_response.setEnabled(is_mimo)
-        self.progressive_correction.setEnabled(not is_doubao)
-        self.checkpoint_min_seconds.setEnabled(not is_doubao)
-        self.checkpoint_pause_ms.setEnabled(not is_doubao)
-        self.checkpoint_max_seconds.setEnabled(not is_doubao)
-        self.low_latency_preview.setEnabled(not is_doubao)
-        self.local_model_dir.setEnabled(not is_doubao and self.low_latency_preview.isChecked())
-        self.local_model_browse.setEnabled(not is_doubao and self.low_latency_preview.isChecked())
-        self.local_threads.setEnabled(not is_doubao and self.low_latency_preview.isChecked())
+        self.progressive_correction.setEnabled(not is_cloud_streaming)
+        self.checkpoint_min_seconds.setEnabled(not is_cloud_streaming)
+        self.checkpoint_pause_ms.setEnabled(not is_cloud_streaming)
+        self.checkpoint_max_seconds.setEnabled(not is_cloud_streaming)
+        self.low_latency_preview.setEnabled(not is_cloud_streaming)
+        self.local_model_dir.setEnabled(
+            not is_cloud_streaming and self.low_latency_preview.isChecked()
+        )
+        self.local_model_browse.setEnabled(
+            not is_cloud_streaming and self.low_latency_preview.isChecked()
+        )
+        self.local_threads.setEnabled(
+            not is_cloud_streaming and self.low_latency_preview.isChecked()
+        )
 
-        if is_doubao:
+        if is_qwen:
+            self.note.setText(
+                "Qwen-Audio 3.0 ASR Flash Streaming 使用百炼 duplex WebSocket："
+                "音频约每 100 ms 上传一次，服务端每次返回中间结果就立即原位更新，"
+                "sentence_end=true 后定稿。自动检测支持中英日等多语种；"
+                "中间结果更新粒度由服务端决定，通常为字词或短词组。"
+            )
+        elif is_doubao:
             self.note.setText(
                 "中文和英语继续使用豆包 bigmodel_async 双向流式接口。明确选择日语时，"
                 "可改用 Google Cloud Speech-to-Text V2 Chirp 3 的 StreamingRecognize，"
-                "获得低延迟 interim 增量结果（通常按短词组更新，不承诺严格逐字）；Google 凭据不可用时自动退回豆包日语分块。"
+                "获得低延迟 interim 增量结果（通常按短词组更新，不承诺严格逐字）；"
+                "Google 凭据不可用时自动退回豆包日语分块。"
                 "自动检测及其他多语种仍使用豆包 bigmodel_nostream。两家服务分别计费。"
             )
         elif is_silicon:
@@ -4841,7 +5056,8 @@ class SettingsDialog(QDialog):
             self.mimo_provider_box.setVisible(is_mimo)
             self.silicon_provider_box.setVisible(is_silicon)
             self.doubao_provider_box.setVisible(is_doubao)
-            self.cloud_correction_box.setVisible(not is_doubao)
+            self.qwen_provider_box.setVisible(is_qwen)
+            self.cloud_correction_box.setVisible(not is_cloud_streaming)
             self.on_advanced_toggled()
         self.on_progressive_correction_changed()
         self.on_low_latency_preview_changed()
@@ -5341,10 +5557,12 @@ class SettingsDialog(QDialog):
 
     def on_advanced_toggled(self, *_: Any) -> None:
         visible = bool(getattr(self, "advanced_toggle", None) and self.advanced_toggle.isChecked())
-        is_doubao = self.provider.currentData() == "doubao_streaming"
+        provider = str(self.provider.currentData() or "mimo")
+        is_doubao = provider == "doubao_streaming"
+        is_cloud_streaming = provider in {"doubao_streaming", "qwen_audio_streaming"}
         if hasattr(self, "advanced_box"):
             self.advanced_box.setVisible(visible)
-            self.batch_advanced_box.setVisible(not is_doubao)
+            self.batch_advanced_box.setVisible(not is_cloud_streaming)
             self.doubao_advanced_box.setVisible(is_doubao)
 
     def on_capture_sources_changed(self, *_: Any) -> None:
@@ -5441,6 +5659,7 @@ class SettingsDialog(QDialog):
         siliconflow_key = self.siliconflow_api_key.text().strip()
         doubao_api_key = self.doubao_api_key.text().strip()
         doubao_token = self.doubao_access_token.text().strip()
+        qwen_api_key = self.qwen_api_key.text().strip()
         if provider == "doubao_streaming":
             saved_api_key = load_doubao_api_key()
             saved_token = load_api_key(provider)
@@ -5464,6 +5683,21 @@ class SettingsDialog(QDialog):
                     self,
                     "缺少豆包凭证",
                     "请填写新版控制台 API Key；或同时填写旧版 APP ID 与 Access Token。",
+                )
+                return
+        elif provider == "qwen_audio_streaming":
+            if not qwen_api_key and not load_api_key(provider):
+                QMessageBox.warning(
+                    self,
+                    "缺少百炼 API Key",
+                    "请填写阿里云百炼 API Key，或设置 DASHSCOPE_API_KEY。",
+                )
+                return
+            if not self.qwen_workspace_id.text().strip():
+                QMessageBox.warning(
+                    self,
+                    "缺少 Workspace ID",
+                    "Qwen-Audio 3.0 Streaming 需要业务空间 Workspace ID。",
                 )
                 return
         else:
@@ -5492,13 +5726,15 @@ class SettingsDialog(QDialog):
             save_doubao_api_key(doubao_api_key)
             if doubao_token:
                 save_api_key("doubao_streaming", doubao_token)
+            if qwen_api_key:
+                save_api_key("qwen_audio_streaming", qwen_api_key)
             self._save_cached_translation_keys()
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存 API Key：{exc}")
             return
 
         model = self.model.currentText().strip()
-        if provider != "doubao_streaming" and not model:
+        if provider not in {"doubao_streaming", "qwen_audio_streaming"} and not model:
             QMessageBox.warning(self, "缺少模型", "请填写识别模型 ID。")
             return
         if provider == "doubao_streaming":
@@ -5614,7 +5850,7 @@ class SettingsDialog(QDialog):
                 QMessageBox.warning(self, "颜色格式无效", f"{label}应使用 #RRGGBB 格式。")
                 return
 
-        if provider != "doubao_streaming" and self.low_latency_preview.isChecked():
+        if provider not in {"doubao_streaming", "qwen_audio_streaming"} and self.low_latency_preview.isChecked():
             model_dir_value = self.local_model_dir.text().strip()
             if model_dir_value:
                 try:
@@ -5635,6 +5871,8 @@ class SettingsDialog(QDialog):
             self.config.siliconflow_model = model
         elif provider == "mimo":
             self.config.mimo_model = model
+        elif provider == "qwen_audio_streaming":
+            self.config.qwen_model = QWEN_AUDIO_STREAMING_MODEL
         self.config.siliconflow_base_url = base_url or DEFAULT_SILICONFLOW_BASE_URL
         self.config.doubao_app_id = self.doubao_app_id.text().strip()
         self.config.doubao_streaming_endpoint = (
@@ -5652,6 +5890,20 @@ class SettingsDialog(QDialog):
             self.doubao_multilingual_chunk.currentData() or 5.0
         )
         self.config.doubao_hotwords = self.doubao_hotwords.toPlainText().strip()
+        self.config.qwen_model = QWEN_AUDIO_STREAMING_MODEL
+        self.config.qwen_workspace_id = self.qwen_workspace_id.text().strip()
+        self.config.qwen_region = str(self.qwen_region.currentData() or "cn-beijing")
+        qwen_hints = str(
+            self.qwen_language_hints.currentData()
+            or self.qwen_language_hints.currentText()
+            or "auto"
+        ).strip()
+        self.config.qwen_language_hints = qwen_hints
+        self.config.qwen_max_sentence_silence_ms = int(
+            self.qwen_sentence_silence.currentData() or 800
+        )
+        self.config.qwen_packet_ms = 100
+        self.config.qwen_hotwords = self.qwen_hotwords.toPlainText().strip()
         self.config.japanese_asr_provider = str(
             self.japanese_asr_provider.currentData() or "google_v2"
         )
@@ -5697,7 +5949,7 @@ class SettingsDialog(QDialog):
         self.config.system_device_key = selected_system_key
         self.config.segmentation_mode = (
             "vad"
-            if provider == "doubao_streaming"
+            if provider in {"doubao_streaming", "qwen_audio_streaming"}
             else str(self.segmentation.currentData() or "vad")
         )
         self.config.vad_mode = int(self.vad_mode.currentData())
@@ -5925,6 +6177,15 @@ class MainWindow(QMainWindow):
         self.google_speech_signals.failed.connect(self.on_google_speech_error)
         self.google_speech_workers: dict[str, GoogleSpeechStreamingWorker] = {}
         self.using_google_japanese = False
+        self.qwen_signals = QwenStreamingSignals()
+        self.qwen_signals.partial.connect(self.on_doubao_partial)
+        self.qwen_signals.final.connect(self.on_doubao_final)
+        self.qwen_signals.segment_timing.connect(self.on_doubao_timing)
+        self.qwen_signals.status.connect(self.on_qwen_status)
+        self.qwen_signals.failed.connect(self.on_qwen_error)
+        self.qwen_signals.usage.connect(self.on_qwen_usage)
+        self.qwen_workers: dict[str, QwenStreamingWorker] = {}
+        self.using_qwen_streaming = False
         self.local_asr_signals = LocalAsrSignals()
         self.local_asr_signals.partial.connect(self.on_local_partial)
         self.local_asr_signals.ended.connect(self.on_local_ended)
@@ -5987,7 +6248,7 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
         self.apply_style()
         self.append_system_message(
-            "1.0.21：选择未定稿字幕时暂停界面改写；字幕显示模式移至翻译设置。"
+            "1.0.22：新增 Qwen-Audio 3.0 ASR Flash Streaming 多语种双向流式识别。"
         )
 
     def _build_ui(self) -> None:
@@ -6349,6 +6610,8 @@ class MainWindow(QMainWindow):
             active_model = self.config.siliconflow_model
         elif provider == "doubao_streaming":
             active_model = "google-chirp-3-ja" if use_google_japanese else "doubao-seed-asr-2.0"
+        elif provider == "qwen_audio_streaming":
+            active_model = QWEN_AUDIO_STREAMING_MODEL
         else:
             active_model = self.config.mimo_model
         self.api_label.setText(f"{provider_name}: 等待语音")
@@ -6386,7 +6649,9 @@ class MainWindow(QMainWindow):
         self.preview_workers.clear()
         self.doubao_workers.clear()
         self.google_speech_workers.clear()
+        self.qwen_workers.clear()
         self.using_google_japanese = use_google_japanese
+        self.using_qwen_streaming = provider == "qwen_audio_streaming"
         active_sources = [
             source
             for source, enabled in (
@@ -6471,6 +6736,46 @@ class MainWindow(QMainWindow):
                             + reason
                         ),
                     )
+        elif provider == "qwen_audio_streaming":
+            proxy_url = ""
+            if self.config.network_proxy_enabled and self.config.network_proxy_asr:
+                proxy_url = normalize_proxy_url(self.config.network_proxy_url)
+            qwen_config = QwenStreamingConfig(
+                api_key=api_key,
+                workspace_id=self.config.qwen_workspace_id.strip(),
+                region=self.config.qwen_region,
+                model=QWEN_AUDIO_STREAMING_MODEL,
+                language_hints=self.config.qwen_language_hints,
+                max_sentence_silence=self.config.qwen_max_sentence_silence_ms,
+                semantic_punctuation_enabled=False,
+                packet_ms=self.config.qwen_packet_ms,
+                hotwords=self.config.qwen_hotwords,
+                proxy_url=proxy_url,
+            )
+            try:
+                endpoint = qwen_config.endpoint
+            except Exception as exc:
+                QMessageBox.warning(self, "Qwen 配置无效", str(exc))
+                self.running = False
+                self.start_button.setText("开始")
+                self.settings_button.setEnabled(True)
+                return
+            for source in active_sources:
+                worker = QwenStreamingWorker(source, qwen_config, self.qwen_signals)
+                worker.start()
+                self.qwen_workers[source] = worker
+            hints = self.config.qwen_language_hints.strip() or "auto"
+            self.api_label.setText(
+                "Qwen-Audio 3.0 Streaming: 就绪（多语种双向流，"
+                f"language_hints={hints}）"
+            )
+            logging.info(
+                "Qwen-Audio streaming enabled endpoint=%s model=%s hints=%s proxy=%s",
+                endpoint,
+                QWEN_AUDIO_STREAMING_MODEL,
+                hints,
+                proxy_url or "direct",
+            )
         else:
             for source in active_sources:
                 worker = ApiWorker(source, api_key, self.config, self.api_signals)
@@ -6519,7 +6824,7 @@ class MainWindow(QMainWindow):
 
         self.local_asr_worker = None
         if (
-            provider != "doubao_streaming"
+            provider not in {"doubao_streaming", "qwen_audio_streaming"}
             and self.config.local_streaming_enabled
             and self.config.segmentation_mode == "vad"
         ):
@@ -6616,7 +6921,11 @@ class MainWindow(QMainWindow):
         for worker in self.google_speech_workers.values():
             worker.stop()
         self.google_speech_workers.clear()
+        for worker in self.qwen_workers.values():
+            worker.stop()
+        self.qwen_workers.clear()
         self.using_google_japanese = False
+        self.using_qwen_streaming = False
         self.audio_engine = None
         self.start_button.setEnabled(True)
         self.start_button.setText("开始")
@@ -6663,6 +6972,10 @@ class MainWindow(QMainWindow):
             self._complete_stop()
 
     def on_live_pcm(self, source: str, pcm: bytes, timestamp: float) -> None:
+        qwen_worker = self.qwen_workers.get(source)
+        if qwen_worker is not None:
+            qwen_worker.feed(pcm, timestamp)
+            return
         google_worker = self.google_speech_workers.get(source)
         if google_worker is not None:
             google_worker.feed(pcm, timestamp)
@@ -6676,6 +6989,10 @@ class MainWindow(QMainWindow):
             worker.feed(source, pcm, timestamp)
 
     def on_live_end(self, source: str, timestamp: float) -> None:
+        qwen_worker = self.qwen_workers.get(source)
+        if qwen_worker is not None:
+            qwen_worker.end(timestamp)
+            return
         google_worker = self.google_speech_workers.get(source)
         if google_worker is not None:
             google_worker.end(timestamp)
@@ -7193,17 +7510,22 @@ class MainWindow(QMainWindow):
         return rendered
 
     def _active_streaming_asr_name(self) -> str:
-        return (
-            "Google 日语实时 ASR"
-            if self.using_google_japanese
-            else "豆包流式 ASR 2.0"
-        )
+        if self.using_qwen_streaming:
+            return "Qwen-Audio 3.0 Streaming"
+        if self.using_google_japanese:
+            return "Google 日语实时 ASR"
+        return "豆包流式 ASR 2.0"
+
+    def _active_asr_hotwords(self) -> str:
+        if self.using_qwen_streaming:
+            return self.config.qwen_hotwords
+        return self.config.doubao_hotwords
 
     def _process_doubao_transcript_only_text(
         self, source: str, timestamp: float, text: str, is_final: bool
     ) -> None:
         """Render provider partials in place and definite text as readable sentences."""
-        cleaned = normalize_asr_hotwords(text, self.config.doubao_hotwords)
+        cleaned = normalize_asr_hotwords(text, self._active_asr_hotwords())
         if not cleaned:
             return
 
@@ -7308,7 +7630,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        cleaned = normalize_asr_hotwords(text, self.config.doubao_hotwords)
+        cleaned = normalize_asr_hotwords(text, self._active_asr_hotwords())
         if not cleaned:
             return
         key = self._transcript_key(source, timestamp)
@@ -7472,6 +7794,36 @@ class MainWindow(QMainWindow):
             self.append_system_message(f"⚠ {source_name}豆包流式识别失败：{message}")
         self.api_label.setText("豆包流式 ASR 2.0: 连接错误")
 
+    def on_qwen_status(self, source: str, message: str) -> None:
+        if not self.running:
+            return
+        source_name = "麦克风" if source == "mic" else "电脑"
+        self.api_label.setText(f"Qwen-Audio 3.0: {source_name} {message}")
+
+    def on_qwen_error(self, source: str, message: str) -> None:
+        source_name = "麦克风" if source == "mic" else "电脑声音"
+        logging.error(
+            "Qwen-Audio streaming error source=%s message=%s", source, message
+        )
+        now = time.monotonic()
+        key = f"qwen-audio-{source}"
+        last_map = getattr(self, "_last_stream_error_notice", {})
+        if now - float(last_map.get(key, 0.0)) > 10.0:
+            last_map[key] = now
+            self._last_stream_error_notice = last_map
+            self.append_system_message(
+                f"⚠ {source_name} Qwen-Audio 3.0 实时识别失败：{message}"
+            )
+        if self.running:
+            self.api_label.setText("Qwen-Audio 3.0 Streaming: 连接错误")
+
+    def on_qwen_usage(self, source: str, duration_seconds: int) -> None:
+        logging.info(
+            "Qwen-Audio billed duration source=%s seconds=%d",
+            source,
+            duration_seconds,
+        )
+
     def on_google_speech_status(self, source: str, message: str) -> None:
         if not self.running:
             return
@@ -7520,7 +7872,7 @@ class MainWindow(QMainWindow):
     def on_audio_chunk(
         self, source: str, wav_bytes: bytes, timestamp: float, reason: str = "silence"
     ) -> None:
-        if self.config.api_provider == "doubao_streaming":
+        if self.config.api_provider in {"doubao_streaming", "qwen_audio_streaming"}:
             return
         self.segment_reasons[self._transcript_key(source, timestamp)] = reason
         worker = self.api_workers.get(source)
